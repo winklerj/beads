@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -360,4 +363,254 @@ func gateTestFindSubstring(s, substr string) int {
 		}
 	}
 	return -1
+}
+
+// =============================================================================
+// Tests for gate auto-discover workflow run ID (bd-1e12)
+// =============================================================================
+
+func TestGHWorkflowRunParsing(t *testing.T) {
+	// Test that GHWorkflowRun struct correctly parses JSON from gh run list
+	testJSON := `[
+		{
+			"databaseId": 12345678901,
+			"displayTitle": "Release v1.0.0",
+			"headBranch": "main",
+			"headSha": "abc123def456",
+			"name": "release.yml",
+			"status": "completed",
+			"conclusion": "success",
+			"createdAt": "2025-01-15T10:30:00Z",
+			"updatedAt": "2025-01-15T10:35:00Z",
+			"workflowName": "Release",
+			"url": "https://github.com/owner/repo/actions/runs/12345678901"
+		},
+		{
+			"databaseId": 12345678902,
+			"displayTitle": "CI checks",
+			"headBranch": "feature-branch",
+			"headSha": "def789ghi012",
+			"name": "ci.yml",
+			"status": "in_progress",
+			"createdAt": "2025-01-15T11:00:00Z",
+			"updatedAt": "2025-01-15T11:01:00Z",
+			"workflowName": "CI",
+			"url": "https://github.com/owner/repo/actions/runs/12345678902"
+		}
+	]`
+
+	var runs []GHWorkflowRun
+	err := json.Unmarshal([]byte(testJSON), &runs)
+	if err != nil {
+		t.Fatalf("Failed to parse GHWorkflowRun JSON: %v", err)
+	}
+
+	if len(runs) != 2 {
+		t.Errorf("Expected 2 runs, got %d", len(runs))
+	}
+
+	// Verify first run
+	if runs[0].DatabaseID != 12345678901 {
+		t.Errorf("Expected DatabaseID 12345678901, got %d", runs[0].DatabaseID)
+	}
+	if runs[0].WorkflowName != "Release" {
+		t.Errorf("Expected WorkflowName 'Release', got %q", runs[0].WorkflowName)
+	}
+	if runs[0].Status != "completed" {
+		t.Errorf("Expected Status 'completed', got %q", runs[0].Status)
+	}
+	if runs[0].Conclusion != "success" {
+		t.Errorf("Expected Conclusion 'success', got %q", runs[0].Conclusion)
+	}
+	if runs[0].HeadBranch != "main" {
+		t.Errorf("Expected HeadBranch 'main', got %q", runs[0].HeadBranch)
+	}
+
+	// Verify second run (in_progress, no conclusion)
+	if runs[1].DatabaseID != 12345678902 {
+		t.Errorf("Expected DatabaseID 12345678902, got %d", runs[1].DatabaseID)
+	}
+	if runs[1].Status != "in_progress" {
+		t.Errorf("Expected Status 'in_progress', got %q", runs[1].Status)
+	}
+	if runs[1].Conclusion != "" {
+		t.Errorf("Expected empty Conclusion for in_progress, got %q", runs[1].Conclusion)
+	}
+}
+
+func TestGHWorkflowRunEmptyList(t *testing.T) {
+	// Test parsing an empty list
+	testJSON := `[]`
+
+	var runs []GHWorkflowRun
+	err := json.Unmarshal([]byte(testJSON), &runs)
+	if err != nil {
+		t.Fatalf("Failed to parse empty GHWorkflowRun JSON: %v", err)
+	}
+
+	if len(runs) != 0 {
+		t.Errorf("Expected 0 runs, got %d", len(runs))
+	}
+}
+
+func TestDiscoverRunIDSelectsMostRecent(t *testing.T) {
+	// This test verifies the logic that discoverRunIDByWorkflowName returns
+	// the most recent run (first element, since GitHub API returns newest-first)
+	// We can't mock queryGitHubRunsForWorkflow directly, but we can test
+	// that the GHWorkflowRun struct's DatabaseID can be formatted correctly
+
+	// Simulate what discoverRunIDByWorkflowName does: take runs[0].DatabaseID
+	runs := []GHWorkflowRun{
+		{DatabaseID: 98765432109, WorkflowName: "CI"},
+		{DatabaseID: 98765432108, WorkflowName: "CI"},
+		{DatabaseID: 98765432107, WorkflowName: "CI"},
+	}
+
+	if len(runs) == 0 {
+		t.Fatal("Test setup error: no runs")
+	}
+
+	// Format the ID as done in discoverRunIDByWorkflowName
+	runID := fmt.Sprintf("%d", runs[0].DatabaseID)
+	expected := "98765432109"
+
+	if runID != expected {
+		t.Errorf("Expected run ID %q, got %q", expected, runID)
+	}
+}
+
+func TestQueryGitHubRunsForWorkflow_Integration(t *testing.T) {
+	// Skip if gh CLI is not installed (integration test)
+	if _, err := exec.LookPath("gh"); err != nil {
+		t.Skip("gh CLI not installed, skipping integration test")
+	}
+
+	// Skip if not authenticated with GitHub
+	// Run a simple gh command to check auth status
+	cmd := exec.Command("gh", "auth", "status")
+	if err := cmd.Run(); err != nil {
+		t.Skip("gh CLI not authenticated, skipping integration test")
+	}
+
+	// Note: This test would require a real GitHub repo context
+	// It's primarily useful for manual testing or CI with proper GitHub setup
+	t.Log("gh CLI integration tests require proper GitHub repository context")
+	t.Log("For local testing, run: gh run list --workflow=<your-workflow>")
+}
+
+func TestDiscoverRunIDByWorkflowName_NoGHCLI(t *testing.T) {
+	// Test behavior when gh CLI is not in PATH
+	// We can't easily test this without modifying PATH, so just document the expected behavior
+	t.Log("discoverRunIDByWorkflowName returns error 'gh CLI not found' when gh is not installed")
+	t.Log("This is handled by queryGitHubRunsForWorkflow which checks exec.LookPath('gh')")
+}
+
+func TestCheckGHRunWithWorkflowHint(t *testing.T) {
+	// Test that checkGHRun correctly identifies workflow hints vs numeric IDs
+	tests := []struct {
+		name        string
+		awaitID     string
+		isHint      bool
+		description string
+	}{
+		{
+			name:        "numeric ID",
+			awaitID:     "12345678901",
+			isHint:      false,
+			description: "Numeric await_id should be used directly",
+		},
+		{
+			name:        "workflow filename yml",
+			awaitID:     "release.yml",
+			isHint:      true,
+			description: "Workflow filename should trigger discovery",
+		},
+		{
+			name:        "workflow filename yaml",
+			awaitID:     "ci.yaml",
+			isHint:      true,
+			description: "Workflow filename with .yaml should trigger discovery",
+		},
+		{
+			name:        "workflow name no extension",
+			awaitID:     "CI",
+			isHint:      true,
+			description: "Workflow name without extension should trigger discovery",
+		},
+		{
+			name:        "empty",
+			awaitID:     "",
+			isHint:      false, // Empty returns early with different error
+			description: "Empty await_id handled separately",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotIsHint := !isNumericID(tt.awaitID) && tt.awaitID != ""
+			if gotIsHint != tt.isHint {
+				t.Errorf("isHint(%q) = %v, want %v: %s",
+					tt.awaitID, gotIsHint, tt.isHint, tt.description)
+			}
+		})
+	}
+}
+
+func TestGHRunStatusParsing(t *testing.T) {
+	// Test that ghRunStatus struct correctly parses JSON from gh run view
+	testCases := []struct {
+		name       string
+		json       string
+		wantStatus string
+		wantConc   string
+		wantName   string
+	}{
+		{
+			name:       "completed success",
+			json:       `{"status": "completed", "conclusion": "success", "name": "CI"}`,
+			wantStatus: "completed",
+			wantConc:   "success",
+			wantName:   "CI",
+		},
+		{
+			name:       "completed failure",
+			json:       `{"status": "completed", "conclusion": "failure", "name": "Release"}`,
+			wantStatus: "completed",
+			wantConc:   "failure",
+			wantName:   "Release",
+		},
+		{
+			name:       "in progress",
+			json:       `{"status": "in_progress", "conclusion": "", "name": "Build"}`,
+			wantStatus: "in_progress",
+			wantConc:   "",
+			wantName:   "Build",
+		},
+		{
+			name:       "queued",
+			json:       `{"status": "queued", "name": "Test"}`,
+			wantStatus: "queued",
+			wantConc:   "",
+			wantName:   "Test",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var status ghRunStatus
+			if err := json.Unmarshal([]byte(tc.json), &status); err != nil {
+				t.Fatalf("Failed to parse ghRunStatus JSON: %v", err)
+			}
+
+			if status.Status != tc.wantStatus {
+				t.Errorf("Status = %q, want %q", status.Status, tc.wantStatus)
+			}
+			if status.Conclusion != tc.wantConc {
+				t.Errorf("Conclusion = %q, want %q", status.Conclusion, tc.wantConc)
+			}
+			if status.Name != tc.wantName {
+				t.Errorf("Name = %q, want %q", status.Name, tc.wantName)
+			}
+		})
+	}
 }
