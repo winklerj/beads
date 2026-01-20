@@ -415,11 +415,12 @@ func mergeIssueConflict(left, right merge.Issue) merge.Issue {
 		result.Notes = left.Notes + "\n\n---\n\n" + right.Notes
 	}
 
-	// Status: closed wins
-	if left.Status == "closed" || right.Status == "closed" {
-		result.Status = "closed"
-	} else if left.Status == "tombstone" || right.Status == "tombstone" {
+	// Status: tombstone wins over closed (deletion is explicit)
+	// This matches the behavior in internal/merge/merge.go:mergeStatus
+	if left.Status == "tombstone" || right.Status == "tombstone" {
 		result.Status = "tombstone"
+	} else if left.Status == "closed" || right.Status == "closed" {
+		result.Status = "closed"
 	} else {
 		result.Status = pickByUpdatedAt(left.Status, right.Status, left.UpdatedAt, right.UpdatedAt)
 	}
