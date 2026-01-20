@@ -363,6 +363,115 @@ Implementations SHOULD support configurable strategies:
 | `theirs` | Remote version wins all conflicts |
 | `manual` | Prompt user for each conflict |
 
+#### 5.4.5 Complete Merge Algorithm (Pseudocode)
+
+```
+function merge_issues(base_jsonl, left_jsonl, right_jsonl) -> merged_jsonl:
+    base_map = parse_to_map(base_jsonl)    // id -> issue
+    left_map = parse_to_map(left_jsonl)
+    right_map = parse_to_map(right_jsonl)
+
+    all_ids = union(keys(base_map), keys(left_map), keys(right_map))
+    result = []
+
+    for id in all_ids:
+        base = base_map.get(id)
+        left = left_map.get(id)
+        right = right_map.get(id)
+
+        merged = merge_single_issue(base, left, right)
+        if merged is not null:
+            result.append(merged)
+
+    return sort_by_id(result)
+
+function merge_single_issue(base, left, right) -> issue or null:
+    // Case 1: Only in one side (addition or deletion)
+    if left is null and right is null:
+        return null  // Deleted from both
+    if base is null and left is null:
+        return right  // Added in right only
+    if base is null and right is null:
+        return left   // Added in left only
+    if left is null:
+        return null   // Deleted in left, deletion wins
+    if right is null:
+        return null   // Deleted in right, deletion wins
+
+    // Case 2: Both sides have the issue
+    left_tomb = is_tombstone(left)
+    right_tomb = is_tombstone(right)
+
+    // Tombstone handling
+    if left_tomb and right_tomb:
+        return merge_tombstones(left, right)
+    if left_tomb and not is_expired(left):
+        return left  // Tombstone wins
+    if right_tomb and not is_expired(right):
+        return right  // Tombstone wins
+    if left_tomb and is_expired(left):
+        return right  // Resurrection allowed
+    if right_tomb and is_expired(right):
+        return left   // Resurrection allowed
+
+    // Case 3: Standard field merge
+    result = new_issue()
+    result.id = left.id
+    result.created_at = left.created_at
+    result.created_by = left.created_by
+
+    // Apply field-specific merge rules
+    result.title = merge_by_updated_at(base.title, left, right)
+    result.description = merge_by_updated_at(base.description, left, right)
+    result.notes = merge_notes(base.notes, left.notes, right.notes)
+    result.status = merge_status(base.status, left.status, right.status)
+    result.priority = merge_priority(base.priority, left.priority, right.priority)
+    result.dependencies = merge_dependencies(base.deps, left.deps, right.deps)
+    result.updated_at = max(left.updated_at, right.updated_at)
+
+    return result
+
+function merge_status(base, left, right) -> status:
+    // Priority: tombstone > closed > standard merge
+    if left == "tombstone" or right == "tombstone":
+        return "tombstone"
+    if left == "closed" or right == "closed":
+        return "closed"
+    return standard_3way_merge(base, left, right)
+
+function merge_dependencies(base, left, right) -> deps[]:
+    base_set = to_set(base)
+    left_set = to_set(left)
+    right_set = to_set(right)
+
+    result = []
+    all_deps = union(base_set, left_set, right_set)
+
+    for dep in all_deps:
+        in_base = dep in base_set
+        in_left = dep in left_set
+        in_right = dep in right_set
+
+        if in_base:
+            // Was in base - check for removals
+            if not in_left or not in_right:
+                continue  // Removal wins
+            result.append(dep)
+        else:
+            // Not in base - additions included
+            if in_left or in_right:
+                result.append(dep)
+
+    return result
+
+function standard_3way_merge(base, left, right) -> value:
+    if base == left and base != right:
+        return right  // Right changed
+    if base == right and base != left:
+        return left   // Left changed
+    return left       // Both changed or no change - left wins
+```
+
 ---
 
 ## 6. Configuration
@@ -500,6 +609,67 @@ The daemon SHOULD support these RPC operations:
 2. If not running and `auto_daemon: true`, CLI starts daemon
 3. Daemon exits after idle timeout (default: 30 minutes)
 4. Daemon writes PID file for process management
+
+### 8.5 RPC Protocol
+
+**Message Format:**
+
+Request:
+```json
+{
+  "id": "unique-request-id",
+  "method": "create_issue",
+  "params": {
+    "title": "Issue title",
+    "description": "Description",
+    "priority": 1
+  }
+}
+```
+
+Response (success):
+```json
+{
+  "id": "unique-request-id",
+  "result": {
+    "issue_id": "bd-abc12"
+  }
+}
+```
+
+Response (error):
+```json
+{
+  "id": "unique-request-id",
+  "error": {
+    "code": 404,
+    "message": "Issue not found"
+  }
+}
+```
+
+**Error Codes:**
+| Code | Meaning |
+|------|---------|
+| 400 | Invalid request |
+| 404 | Not found |
+| 409 | Conflict |
+| 500 | Internal error |
+
+**Connection Protocol:**
+1. Client connects to socket
+2. Send newline-delimited JSON requests
+3. Read newline-delimited JSON responses
+4. Match responses to requests by `id` field
+5. Close connection or keep alive for multiple requests
+
+### 8.6 File Watching
+
+The daemon SHOULD watch for changes to:
+- `.beads/issues.jsonl` - Trigger import on external modification
+- `.beads/config.yaml` - Reload configuration
+
+**Debouncing:** Wait 100-500ms after last change before processing to batch rapid edits.
 
 ---
 
@@ -797,17 +967,614 @@ $ git push
 
 ---
 
-## Appendix C: Glossary
+## 15. Agent Coordination System
+
+This section specifies features for AI agent coordination in multi-agent environments.
+
+### 15.1 Agent Identity Fields
+
+Issues representing agents SHOULD include these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `agent_state` | enum | Current state: idle, spawning, running, working, stuck, done, stopped, dead |
+| `last_activity` | timestamp | Last heartbeat/action timestamp for timeout detection |
+| `role_type` | string | Agent role: polecat, crew, witness, refinery, mayor, deacon |
+| `rig` | string | Workspace/repository context identifier |
+
+### 15.2 Slot Mechanism
+
+Slots enforce cardinality constraints on issue references (0..1 relationship):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `hook_bead` | string | Currently assigned work (at most one) |
+| `role_bead` | string | Reference to role definition |
+
+**Operations:**
+- `set_slot(agent_id, slot_name, bead_id)` - Assign (fails if occupied)
+- `clear_slot(agent_id, slot_name)` - Release
+- `get_slot(agent_id, slot_name)` - Query current value
+
+### 15.3 Gate Mechanism
+
+Gates provide async coordination primitives for waiting on external conditions:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `await_type` | string | Condition type: timer, human, bead, or platform-specific |
+| `await_id` | string | Condition identifier (e.g., workflow ID, PR number) |
+| `timeout` | duration | Maximum wait time before escalation |
+| `waiters` | string[] | Entities to notify when gate resolves |
+
+**Gate Types:**
+| Type | Resolution Condition |
+|------|---------------------|
+| `timer` | Timeout duration elapsed |
+| `human` | Manual resolution via command |
+| `bead` | Referenced issue closes |
+
+**Operations:**
+- `create_gate(issue_id, type, id, timeout)` - Create gate
+- `check_gates()` - Evaluate all gates, auto-resolve if conditions met
+- `resolve_gate(issue_id)` - Manual resolution
+- `add_waiter(issue_id, waiter)` - Register notification target
+
+### 15.4 Messaging Fields
+
+For inter-agent communication:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `sender` | string | Message originator identifier |
+| `ephemeral` | boolean | If true, excluded from JSONL export; can be bulk-deleted |
+
+### 15.5 Session Tracking
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `closed_by_session` | string | Session identifier that closed the issue |
+
+### 15.6 Agent State Machine
+
+```
+idle → spawning → running ↔ working → done → stopped
+                     ↓         ↓
+                   stuck     dead
+```
+
+| State | Description |
+|-------|-------------|
+| `idle` | Waiting for work assignment |
+| `spawning` | Starting up |
+| `running` | Executing (general) |
+| `working` | Actively working on specific task |
+| `stuck` | Blocked, needs intervention |
+| `done` | Completed current work |
+| `stopped` | Clean shutdown |
+| `dead` | Unclean termination (detected via timeout) |
+
+---
+
+## 16. Advanced Synchronization Features
+
+### 16.1 Export Policies
+
+Implementations SHOULD support configurable error handling during export:
+
+| Policy | Behavior |
+|--------|----------|
+| `strict` | Fail immediately on any error (default for manual export) |
+| `best-effort` | Skip failures with warnings, continue processing (default for auto-export) |
+| `partial` | Retry transient failures with backoff; skip persistent failures |
+| `required-core` | Fail on issue/dependency errors; best-effort for labels/comments |
+
+**Configuration:**
+```yaml
+export:
+  error_policy: strict
+  retry_attempts: 3
+  retry_backoff_ms: 100
+```
+
+### 16.2 Additional Sync Modes
+
+Beyond the required `git-portable` mode:
+
+| Mode | Behavior |
+|------|----------|
+| `dolt-native` | Use Dolt database remotes directly; skip JSONL |
+| `belt-and-suspenders` | Use both Dolt remotes AND JSONL for redundancy |
+
+### 16.3 Sync Branch Mode
+
+For team workflows, a dedicated sync branch prevents conflicts:
+
+**Requirements:**
+- Branch name MUST NOT be `main` or `master`
+- Branch name MUST match pattern: `^[a-zA-Z0-9][a-zA-Z0-9._/-]*[a-zA-Z0-9]$`
+- No consecutive dots (`..`)
+- Maximum 255 characters
+
+**Configuration:**
+```yaml
+sync:
+  branch: beads-sync
+```
+
+### 16.4 Dirty Tracking
+
+For incremental exports:
+
+**Operations:**
+- `mark_dirty(issue_id)` - Flag issue as modified since last export
+- `get_dirty_issues()` - Return IDs of modified issues
+- `clear_dirty(issue_ids)` - Clear flags after successful export
+- `get_export_hash()` - Content hash of last export
+- `set_export_hash(hash)` - Store hash after export
+
+**Algorithm:**
+```
+if incremental_export:
+    dirty_ids = get_dirty_issues()
+    existing_issues = parse_jsonl(issues.jsonl)
+    for id in dirty_ids:
+        existing_issues[id] = get_issue(id)
+    write_jsonl(existing_issues)
+    clear_dirty(dirty_ids)
+```
+
+### 16.5 Import Validation
+
+**Collision Detection:**
+| Category | Condition | Action |
+|----------|-----------|--------|
+| Exact Match | Same ID and content | Skip (idempotent) |
+| Collision | Same ID, different content | Merge per strategy |
+| New | ID doesn't exist | Create |
+
+**Orphan Handling:**
+| Mode | Behavior |
+|------|----------|
+| `strict` | Fail if parent issue missing |
+| `skip` | Skip orphaned issues with warning |
+| `allow` | Import orphans without validation (default) |
+
+---
+
+## 17. Formula System
+
+Formulas define reusable workflow templates with composition capabilities.
+
+### 17.1 Formula Types
+
+| Type | Purpose |
+|------|---------|
+| `workflow` | Standard multi-step process template |
+| `expansion` | Macro that expands into multiple steps |
+| `aspect` | Cross-cutting concern applied to other formulas |
+
+### 17.2 Formula Definition
+
+```yaml
+formula: mol-feature
+description: Standard feature development workflow
+version: 1
+type: workflow
+extends: []
+vars:
+  feature_name:
+    description: Name of the feature
+    required: true
+  reviewer:
+    description: Code reviewer
+    default: ""
+steps:
+  - id: design
+    title: "Design {{feature_name}}"
+    type: task
+    priority: 1
+  - id: implement
+    title: "Implement {{feature_name}}"
+    depends_on: [design]
+  - id: review
+    title: "Review {{feature_name}}"
+    depends_on: [implement]
+    assignee: "{{reviewer}}"
+```
+
+### 17.3 Variable Substitution
+
+**Syntax:** `{{variable_name}}`
+
+**Scope:** Variables are substituted at instantiation time.
+
+**Validation:**
+- `required: true` - Must be provided
+- `enum: [a, b, c]` - Value must be in list
+- `pattern: "^[a-z]+$"` - Must match regex
+
+### 17.4 Inheritance
+
+Formulas can extend other formulas:
+
+```yaml
+formula: mol-secure-feature
+extends: [mol-feature]
+steps:
+  - id: security-review
+    title: "Security review for {{feature_name}}"
+    depends_on: [implement]
+```
+
+**Resolution:** Parent definitions loaded first; child overrides on conflict.
+
+### 17.5 Composition Rules
+
+**Bond Points:** Named attachment sites for extending workflows
+```yaml
+compose:
+  bond_points:
+    - id: after-design
+      after_step: design
+```
+
+**Expansions:** Replace steps with expanded templates
+```yaml
+compose:
+  expand:
+    - target: implement
+      with: exp-tdd-cycle
+      vars:
+        coverage: "80"
+```
+
+**Aspects:** Apply cross-cutting concerns
+```yaml
+compose:
+  aspects: [security-audit, logging]
+```
+
+### 17.6 Aspect Advice
+
+Aspects use advice rules to inject steps:
+
+```yaml
+formula: asp-security
+type: aspect
+advice:
+  - target: "*.implement"  # Glob pattern
+    after:
+      id: "security-scan-{step.id}"
+      title: "Security scan after {step.title}"
+```
+
+**Target Patterns:**
+- `"design"` - Exact match
+- `"*.implement"` - Suffix match
+- `"feature.*"` - Prefix match
+- `"*"` - Match all
+
+### 17.7 Step Definition
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Unique within formula |
+| `title` | string | Issue title (supports variables) |
+| `description` | string | Issue description |
+| `type` | string | task, bug, feature, epic |
+| `priority` | integer | 0-4 |
+| `depends_on` | string[] | Step ID dependencies |
+| `assignee` | string | Default assignee |
+| `condition` | string | Include only if condition true |
+| `expand` | string | Inline expansion formula |
+
+### 17.8 Control Flow
+
+**Loops:**
+```yaml
+- id: iteration
+  loop:
+    count: 3  # Fixed count
+    # OR
+    range: "1..{{max_iterations}}"  # Variable range
+```
+
+**Gates:**
+```yaml
+- id: wait-for-approval
+  gate:
+    type: human
+    timeout: 24h
+```
+
+**Conditions:**
+```yaml
+- id: optional-step
+  condition: "{{include_tests}} == true"
+```
+
+### 17.9 Instantiation Process
+
+1. Load formula and resolve inheritance chain
+2. Apply composition rules (expansions, aspects)
+3. Filter steps by conditions
+4. Substitute variables
+5. Create issues with dependencies
+
+---
+
+## 18. Ready Work Algorithm
+
+### 18.1 Definition
+
+An issue is "ready" when:
+1. Status is `open`
+2. No blocking dependencies exist where the blocker is not closed
+
+### 18.2 Algorithm
+
+```
+function get_ready_work():
+    ready = []
+    for issue in get_issues_by_status("open"):
+        if is_ready(issue):
+            ready.append(issue)
+    return sort_by_priority(ready)
+
+function is_ready(issue):
+    for dep in get_dependencies(issue.id):
+        if dep.type in [blocks, parent-child, conditional-blocks]:
+            blocker = get_issue(dep.depends_on_id)
+            if blocker.status not in [closed, tombstone]:
+                return false
+    return true
+```
+
+### 18.3 Sorting
+
+Ready issues SHOULD be sorted by:
+1. Priority (ascending: 0 = highest)
+2. Created date (ascending: oldest first)
+3. ID (lexicographic, for determinism)
+
+---
+
+## 19. Multi-Process Coordination
+
+### 19.1 Lock File Protocol
+
+For coordinating multiple CLI processes:
+
+**Lock File Location:** `.beads/.lock`
+
+**Protocol:**
+1. Acquire lock before write operations
+2. Use advisory locking (flock on POSIX, LockFileEx on Windows)
+3. Release lock after operation completes
+4. Timeout: 30 seconds default
+
+### 19.2 Database Locking
+
+For SQL-based storage:
+- Use IMMEDIATE transactions for writes
+- Allows concurrent readers during write transaction
+- Prevents write-write conflicts
+
+### 19.3 Daemon Coordination
+
+If daemon is running:
+- CLI connects via socket before operations
+- Daemon holds primary database connection
+- CLI operations route through daemon
+- File watcher notifies daemon of external changes
+
+### 19.4 Export Atomicity
+
+To prevent partial exports:
+1. Write to temporary file
+2. Compute content hash
+3. Atomic rename to target path
+4. Update export metadata
+
+---
+
+## 20. Extended Dependency Types
+
+Beyond basic blocking relationships:
+
+| Type | Semantics | Affects Ready? |
+|------|-----------|----------------|
+| `blocks` | Must close before dependent proceeds | Yes |
+| `parent-child` | Hierarchical containment | Yes |
+| `conditional-blocks` | Blocks only if condition met | Yes |
+| `waits-for` | Fanout gate for dynamic children | Yes |
+| `related` | Informational link | No |
+| `discovered-from` | Origin tracking | No |
+| `caused-by` | Audit trail | No |
+| `tracks` | Cross-project reference | No |
+
+---
+
+## Appendix C: Recommended Database Schema
+
+For implementations using SQL storage:
+
+```sql
+-- Core issues table
+CREATE TABLE issues (
+    id TEXT PRIMARY KEY,
+    content_hash TEXT,
+    title TEXT NOT NULL,
+    description TEXT,
+    design TEXT,
+    acceptance_criteria TEXT,
+    notes TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    priority INTEGER DEFAULT 2,
+    issue_type TEXT DEFAULT 'task',
+    assignee TEXT,
+    owner TEXT,
+    estimated_minutes INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    closed_at TEXT,
+    close_reason TEXT,
+    closed_by_session TEXT,
+    due_at TEXT,
+    defer_until TEXT,
+    external_ref TEXT,
+    source_system TEXT,
+    created_by TEXT,
+    -- Tombstone fields
+    deleted_at TEXT,
+    deleted_by TEXT,
+    delete_reason TEXT,
+    original_type TEXT,
+    -- Agent fields
+    hook_bead TEXT,
+    role_bead TEXT,
+    agent_state TEXT,
+    last_activity TEXT,
+    role_type TEXT,
+    rig TEXT,
+    -- Gate fields
+    await_type TEXT,
+    await_id TEXT,
+    timeout_ns INTEGER,
+    waiters TEXT,  -- JSON array
+    -- Messaging fields
+    sender TEXT,
+    ephemeral INTEGER DEFAULT 0,
+    -- Compaction fields
+    compaction_level INTEGER DEFAULT 0,
+    compacted_at TEXT,
+    original_size INTEGER,
+    summary TEXT,
+    -- Formula tracking
+    source_formula TEXT,
+    source_location TEXT
+);
+
+-- Indexes for common queries
+CREATE INDEX idx_issues_status ON issues(status);
+CREATE INDEX idx_issues_assignee ON issues(assignee);
+CREATE INDEX idx_issues_priority ON issues(priority);
+CREATE INDEX idx_issues_updated_at ON issues(updated_at);
+CREATE INDEX idx_issues_external_ref ON issues(external_ref);
+CREATE INDEX idx_issues_ephemeral ON issues(ephemeral) WHERE ephemeral = 1;
+
+-- Dependencies table
+CREATE TABLE dependencies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id TEXT NOT NULL,
+    depends_on_id TEXT NOT NULL,
+    type TEXT NOT NULL DEFAULT 'blocks',
+    created_at TEXT,
+    created_by TEXT,
+    metadata TEXT,  -- JSON for type-specific data
+    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE,
+    FOREIGN KEY (depends_on_id) REFERENCES issues(id) ON DELETE CASCADE,
+    UNIQUE(issue_id, depends_on_id, type)
+);
+
+CREATE INDEX idx_dependencies_issue ON dependencies(issue_id);
+CREATE INDEX idx_dependencies_depends_on ON dependencies(depends_on_id);
+
+-- Labels table
+CREATE TABLE labels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    created_at TEXT,
+    created_by TEXT,
+    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE,
+    UNIQUE(issue_id, name)
+);
+
+CREATE INDEX idx_labels_issue ON labels(issue_id);
+CREATE INDEX idx_labels_name ON labels(name);
+
+-- Comments table
+CREATE TABLE comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id TEXT NOT NULL,
+    author TEXT,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_comments_issue ON comments(issue_id);
+
+-- Events table (audit trail)
+CREATE TABLE events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    actor TEXT,
+    timestamp TEXT NOT NULL,
+    changes TEXT,  -- JSON object
+    reason TEXT,
+    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_events_issue ON events(issue_id);
+CREATE INDEX idx_events_timestamp ON events(timestamp);
+
+-- Export tracking for dirty/incremental exports
+CREATE TABLE export_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at TEXT
+);
+
+-- Dirty issues for incremental export
+CREATE TABLE dirty_issues (
+    issue_id TEXT PRIMARY KEY,
+    marked_at TEXT NOT NULL,
+    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+);
+
+-- Configuration storage
+CREATE TABLE config (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at TEXT
+);
+```
+
+**Notes:**
+- Use TEXT for timestamps (RFC3339 format) for portability
+- JSON fields stored as TEXT for flexibility
+- Enable WAL mode for concurrent access: `PRAGMA journal_mode=WAL`
+- Use IMMEDIATE transactions for write operations
+
+---
+
+## Appendix D: Glossary
 
 | Term | Definition |
 |------|------------|
+| **Advice** | Step transformation rule in aspect formulas |
+| **Aspect** | Cross-cutting formula that modifies other formulas |
 | **Base** | Common ancestor in three-way merge |
 | **Blocking** | A dependency that prevents work from starting |
+| **Bond Point** | Named attachment site in a formula |
 | **Clean Room** | Implementation without reference to existing code |
 | **Deterministic** | Same input always produces same output |
+| **Dirty Tracking** | Marking modified issues for incremental export |
+| **Ephemeral** | Issue excluded from export (temporary) |
+| **Expansion** | Macro formula that expands into multiple steps |
+| **Formula** | Reusable workflow template |
+| **Gate** | Async coordination primitive for waiting |
 | **Idempotent** | Operation can be repeated without changing result |
 | **JSONL** | JSON Lines - newline-delimited JSON format |
+| **Molecule** | Instantiated formula (working copy) |
 | **Ready Work** | Issues with status=open and no open blocking dependencies |
 | **Resurrection** | Recreating a tombstoned issue |
+| **Rig** | Workspace/repository context for agents |
+| **Slot** | Cardinality-enforced reference field (0..1) |
 | **Tombstone** | Soft-delete marker for distributed consistency |
 | **TTL** | Time To Live - expiration duration |
+| **Waiter** | Entity registered for gate resolution notification |
